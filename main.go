@@ -150,20 +150,56 @@ func main() {
 
 	t.Print()
 
+	checkMap := make(map[string]bool)
+	for _, n := range associatedNodes {
+		checkMap[n.Uid] = true
+	}
+
 	aclBytes, err := ioutil.ReadFile(*acls)
 	check(err)
 
 	var rules []json.RawMessage
 	check(json.Unmarshal(aclBytes, &rules))
 
-	aclRules := make([]ACLRule, len(rules))
+	var accessTo []ACLRule
+	var accessFrom []ACLRule
+
+OuterLoop:
 	for _, r := range rules {
 		if bytes.Contains(r, []byte("access-rule")) {
 			var acl ACLRule
 			check(json.Unmarshal(r, &acl))
-			aclRules[acl.Number] = acl
+			if acl.Enabled {
+
+				for _, uid := range acl.Source {
+					if isAssociated(checkMap, allObjects, acl, uid) && !acl.SrcNegate {
+						accessTo = append(accessTo, acl)
+						continue OuterLoop
+					}
+				}
+
+				for _, uid := range acl.Destination {
+					if isAssociated(checkMap, allObjects, acl, uid) && !acl.DstNegate {
+						accessFrom = append(accessFrom, acl)
+						continue OuterLoop
+					}
+				}
+
+			}
 		}
 	}
+
+	fmt.Print("\n")
+
+	accessToTable, _ := table.NewTable(*target+"->Target", "No.", "Src", "Dst", "Service")
+	buildTable(&accessToTable, accessTo, allObjects)
+	accessToTable.Print()
+
+	fmt.Print("\n")
+
+	accessFromTable, _ := table.NewTable("Target->"+*target, "No.", "Src", "Dst", "Service")
+	buildTable(&accessFromTable, accessFrom, allObjects)
+	accessFromTable.Print()
 
 }
 
@@ -197,4 +233,65 @@ func getAssociatedNodes(n *Node) (assoc []*Node) {
 	}
 
 	return
+}
+
+func isAssociated(associatedObjects map[string]bool, allObjects map[string]*Node, acl ACLRule, uid string) bool {
+	return (associatedObjects[uid] || allObjects[uid].Type == "CpmiAnyObject") &&
+		allObjects[acl.Action].Name == "Accept"
+}
+
+func buildTable(table *table.Table, acl []ACLRule, allObjects map[string]*Node) {
+	for _, aclr := range acl {
+
+		src := ""
+		for _, v := range aclr.Source {
+			if aclr.SrcNegate {
+				src += "!"
+			}
+
+			src += allObjects[v].Name + "\n"
+
+		}
+		src = src[:len(src)-1]
+
+		dst := ""
+		for _, v := range aclr.Destination {
+			if aclr.DstNegate {
+				dst += "!"
+			}
+
+			dst += allObjects[v].Name + "\n"
+
+		}
+		dst = dst[:len(dst)-1]
+
+		service := ""
+		for _, v := range aclr.Service {
+			serv := allObjects[v]
+
+			if strings.Contains(serv.Type, "group") {
+				for _, member := range serv.Members {
+					subservice := allObjects[member]
+					service += subservice.Name + ":" + subservice.Type
+					if !strings.Contains(subservice.Type, "icmp") {
+						service += ":" + subservice.Port
+					}
+					service += "\n"
+				}
+				continue
+			}
+
+			service += serv.Name + ":" + serv.Type
+			if !strings.Contains(serv.Type, "icmp") {
+				service += ":" + serv.Port
+			}
+			service += "\n"
+
+		}
+
+		err := table.AddValues(fmt.Sprintf("%d", aclr.Number), src, dst, service)
+		check(err)
+
+	}
+
 }
