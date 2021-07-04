@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/md5"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
+	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/NHAS/checkpoint-audit/table"
@@ -27,6 +30,10 @@ type Node struct {
 	Members       []string
 
 	Edges []*Edge
+}
+
+func (n *Node) Hash() string {
+	return fmt.Sprintf("%s", md5.Sum([]byte(n.Uid+n.Name+n.Type+n.IPv4+n.SubnetAddress+n.Port+n.Protocol)))
 }
 
 type Edge struct {
@@ -70,50 +77,55 @@ func check(err error) {
 	}
 }
 
-func main() {
-
-	objPath := flag.String("objs", "", "Objects file")
-	acls := flag.String("acls", "", "ACL file")
-	target := flag.String("t", "", "Target node (by name)")
-
-	flag.Parse()
-
-	objs, err := ioutil.ReadFile(*objPath)
-	check(err)
-
-	var jsonObjects []json.RawMessage
-	check(json.Unmarshal(objs, &jsonObjects))
-
-	nameMap := make(map[string]string)
-
-	allObjects := make(map[string]*Node)
+func loadObjects(paths []string) (names map[string]string, objects map[string]*Node) {
 
 	groups := []*Node{}
 	networks := []*Node{}
 	hosts := []*Node{}
 
-	//Populate all objects
-	for _, v := range jsonObjects {
-		var n Node
-		check(json.Unmarshal(v, &n))
-		allObjects[n.Uid] = &n
+	names = make(map[string]string)
+	objects = make(map[string]*Node)
 
-		switch n.Type {
-		case "host":
-			hosts = append(hosts, &n)
-		case "group", "service-group":
-			groups = append(groups, &n)
-		case "network":
-			networks = append(networks, &n)
+	for _, path := range paths {
+
+		objs, err := ioutil.ReadFile(path)
+		check(err)
+
+		var jsonObjects []json.RawMessage
+		check(json.Unmarshal(objs, &jsonObjects))
+
+		//Populate all objects
+		for _, v := range jsonObjects {
+			var n Node
+			check(json.Unmarshal(v, &n))
+
+			if _, ok := objects[n.Uid]; ok {
+				if n.Hash() != objects[n.Uid].Hash() {
+					log.Fatal("Nodes not equal\n%v\n%v", n, objects[n.Uid])
+				}
+
+				continue
+			}
+
+			objects[n.Uid] = &n
+
+			switch n.Type {
+			case "host":
+				hosts = append(hosts, &n)
+			case "group", "service-group":
+				groups = append(groups, &n)
+			case "network":
+				networks = append(networks, &n)
+			}
+
+			names[n.Name] = n.Uid
 		}
-
-		nameMap[n.Name] = n.Uid
 	}
 
 	//Dereference objects and populate groups
 	for g := range groups {
 		for _, m := range groups[g].Members {
-			Monodirectional(allObjects[m], groups[g])
+			Monodirectional(objects[m], groups[g])
 		}
 	}
 
@@ -128,12 +140,38 @@ func main() {
 		}
 	}
 
-	associatedNodes := getAssociatedNodes(allObjects[nameMap[*target]])
+	return
+}
+
+func main() {
+
+	directory := flag.String("path", "", "Path to checkpoint exported resources")
+	target := flag.String("t", "", "Target node (by name)")
+
+	flag.Parse()
+
+	matches, err := filepath.Glob(path.Join(*directory, "*_objects.json"))
+	check(err)
+
+	namesMap, allObjects := loadObjects(matches)
+
+	if *target == "" {
+		for n := range namesMap {
+			fmt.Println(n)
+		}
+		return
+	}
+
+	associatedNodes := getAssociatedNodes(allObjects[namesMap[*target]])
 
 	t, err := table.NewTable(*target+" Belongs To", "Name", "Type", "Extra", "Comment", "UID")
 	check(err)
 
+	checkMap := make(map[string]bool)
+
 	for _, currentNode := range associatedNodes {
+
+		checkMap[currentNode.Uid] = true
 
 		extraData := ""
 		switch currentNode.Type {
@@ -150,43 +188,43 @@ func main() {
 
 	t.Print()
 
-	checkMap := make(map[string]bool)
-	for _, n := range associatedNodes {
-		checkMap[n.Uid] = true
-	}
-
-	aclBytes, err := ioutil.ReadFile(*acls)
-	check(err)
-
-	var rules []json.RawMessage
-	check(json.Unmarshal(aclBytes, &rules))
+	matches, err = filepath.Glob(path.Join(*directory, "*Security-s116.json"))
 
 	var accessTo []ACLRule
 	var accessFrom []ACLRule
 
-OuterLoop:
-	for _, r := range rules {
-		if bytes.Contains(r, []byte("access-rule")) {
-			var acl ACLRule
-			check(json.Unmarshal(r, &acl))
-			if acl.Enabled {
+	for _, p := range matches {
+		aclBytes, err := ioutil.ReadFile(p)
+		check(err)
 
-				for _, uid := range acl.Source {
-					if isAssociated(checkMap, allObjects, acl, uid) && !acl.SrcNegate {
-						accessTo = append(accessTo, acl)
-						continue OuterLoop
+		var rules []json.RawMessage
+		check(json.Unmarshal(aclBytes, &rules))
+
+	OuterLoop:
+		for _, r := range rules {
+			if bytes.Contains(r, []byte("access-rule")) {
+				var acl ACLRule
+				check(json.Unmarshal(r, &acl))
+				if acl.Enabled {
+
+					for _, uid := range acl.Source {
+						if isAssociated(checkMap, allObjects, acl, uid) && !acl.SrcNegate {
+							accessTo = append(accessTo, acl)
+							continue OuterLoop
+						}
 					}
-				}
 
-				for _, uid := range acl.Destination {
-					if isAssociated(checkMap, allObjects, acl, uid) && !acl.DstNegate {
-						accessFrom = append(accessFrom, acl)
-						continue OuterLoop
+					for _, uid := range acl.Destination {
+						if isAssociated(checkMap, allObjects, acl, uid) && !acl.DstNegate {
+							accessFrom = append(accessFrom, acl)
+							continue OuterLoop
+						}
 					}
-				}
 
+				}
 			}
 		}
+
 	}
 
 	fmt.Print("\n")
@@ -236,8 +274,7 @@ func getAssociatedNodes(n *Node) (assoc []*Node) {
 }
 
 func isAssociated(associatedObjects map[string]bool, allObjects map[string]*Node, acl ACLRule, uid string) bool {
-	return (associatedObjects[uid] || allObjects[uid].Type == "CpmiAnyObject") &&
-		allObjects[acl.Action].Name == "Accept"
+	return (associatedObjects[uid] || allObjects[uid].Type == "CpmiAnyObject") && allObjects[acl.Action].Name == "Accept"
 }
 
 func buildTable(table *table.Table, acl []ACLRule, allObjects map[string]*Node) {
