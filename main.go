@@ -101,7 +101,7 @@ func loadObjects(paths []string) (names map[string]string, objects map[string]*N
 
 			if _, ok := objects[n.Uid]; ok {
 				if n.Hash() != objects[n.Uid].Hash() {
-					log.Fatal("Nodes not equal\n%v\n%v", n, objects[n.Uid])
+					log.Fatalf("Nodes not equal\n%v\n%v", n, objects[n.Uid])
 				}
 
 				continue
@@ -147,6 +147,8 @@ func main() {
 
 	directory := flag.String("path", "", "Path to checkpoint exported resources")
 	target := flag.String("t", "", "Target node (by name)")
+	assocOnly := flag.Bool("g", false, "Associated groups/nodes/networks only, i.e dont find firewall rules")
+	childrenOnly := flag.Bool("c", false, "Get all children BFS")
 
 	flag.Parse()
 
@@ -162,7 +164,12 @@ func main() {
 		return
 	}
 
-	associatedNodes := getAssociatedNodes(allObjects[namesMap[*target]])
+	var associatedNodes []*Node
+	if !*childrenOnly {
+		associatedNodes = getPermissionGroups(allObjects[namesMap[*target]])
+	} else {
+		associatedNodes = getAllChildren(allObjects[namesMap[*target]])
+	}
 
 	t, err := table.NewTable(*target+" Belongs To", "Name", "Type", "Extra", "Comment", "UID")
 	check(err)
@@ -188,6 +195,10 @@ func main() {
 
 	t.Print()
 
+	if *assocOnly || *childrenOnly {
+		return
+	}
+
 	matches, err = filepath.Glob(path.Join(*directory, "*Security-s116.json"))
 
 	var accessTo []ACLRule
@@ -208,14 +219,17 @@ func main() {
 				if acl.Enabled {
 
 					for _, uid := range acl.Source {
-						if isAssociated(checkMap, allObjects, acl, uid) && !acl.SrcNegate {
+						applies := doesRuleApply(checkMap, allObjects, acl, uid)
+						//Xor If it applies and is not negated, and if it doesnt apply but is negated
+						if applies != acl.SrcNegate {
 							accessTo = append(accessTo, acl)
 							continue OuterLoop
 						}
 					}
 
 					for _, uid := range acl.Destination {
-						if isAssociated(checkMap, allObjects, acl, uid) && !acl.DstNegate {
+						applies := doesRuleApply(checkMap, allObjects, acl, uid)
+						if applies != acl.DstNegate {
 							accessFrom = append(accessFrom, acl)
 							continue OuterLoop
 						}
@@ -229,26 +243,51 @@ func main() {
 
 	fmt.Print("\n")
 
-	accessToTable, _ := table.NewTable(*target+"->Target", "No.", "Src", "Dst", "Service")
+	accessToTable, _ := table.NewTable(*target+"->Target", "No.", "Src", "Dst", "Service", "Action")
 	buildTable(&accessToTable, accessTo, allObjects)
 	accessToTable.Print()
 
 	fmt.Print("\n")
 
-	accessFromTable, _ := table.NewTable("Target->"+*target, "No.", "Src", "Dst", "Service")
+	accessFromTable, _ := table.NewTable("Target->"+*target, "No.", "Src", "Dst", "Service", "Action")
 	buildTable(&accessFromTable, accessFrom, allObjects)
 	accessFromTable.Print()
 
 }
 
-func getAssociatedNodes(n *Node) (assoc []*Node) {
+func getAllChildren(n *Node) (children []*Node) {
 	visited := make(map[*Node]bool)
 
 	visited[n] = true
 	searchSpace := []*Node{n}
-	//Only add directly connected networks
+
+	for len(searchSpace) != 0 {
+		currentNode := searchSpace[0]
+		children = append(children, currentNode)
+		searchSpace = searchSpace[1:]
+
+		for _, e := range currentNode.Edges {
+			if visited[e.End] {
+				continue
+			}
+
+			searchSpace = append(searchSpace, e.End)
+			visited[e.End] = true
+
+		}
+	}
+
+	return
+}
+
+func getPermissionGroups(n *Node) (assoc []*Node) {
+	visited := make(map[*Node]bool)
+
+	visited[n] = true
+	searchSpace := []*Node{n}
+	//Only add directly connected networks and hosts
 	for _, e := range n.Edges {
-		if !visited[e.End] && e.End.Type == "network" {
+		if !visited[e.End] && (e.End.Type == "network" || e.End.Type == "host") {
 			visited[e.End] = true
 			searchSpace = append(searchSpace, e.End)
 		}
@@ -260,7 +299,7 @@ func getAssociatedNodes(n *Node) (assoc []*Node) {
 		searchSpace = searchSpace[1:]
 
 		for _, e := range currentNode.Edges {
-			if visited[e.Start] {
+			if visited[e.Start] || currentNode.Type == "host" {
 				continue
 			}
 
@@ -273,8 +312,8 @@ func getAssociatedNodes(n *Node) (assoc []*Node) {
 	return
 }
 
-func isAssociated(associatedObjects map[string]bool, allObjects map[string]*Node, acl ACLRule, uid string) bool {
-	return (associatedObjects[uid] || allObjects[uid].Type == "CpmiAnyObject") && allObjects[acl.Action].Name == "Accept"
+func doesRuleApply(associatedObjects map[string]bool, allObjects map[string]*Node, acl ACLRule, uid string) bool {
+	return (associatedObjects[uid] || allObjects[uid].Type == "CpmiAnyObject")
 }
 
 func buildTable(table *table.Table, acl []ACLRule, allObjects map[string]*Node) {
@@ -306,15 +345,8 @@ func buildTable(table *table.Table, acl []ACLRule, allObjects map[string]*Node) 
 		for _, v := range aclr.Service {
 			serv := allObjects[v]
 
-			if strings.Contains(serv.Type, "group") {
-				for _, member := range serv.Members {
-					subservice := allObjects[member]
-					service += subservice.Name + ":" + subservice.Type
-					if !strings.Contains(subservice.Type, "icmp") {
-						service += ":" + subservice.Port
-					}
-					service += "\n"
-				}
+			if strings.Contains(serv.Type, "service-group") {
+				service += recurseServiceGroup(serv, serv.Name, allObjects)
 				continue
 			}
 
@@ -322,13 +354,39 @@ func buildTable(table *table.Table, acl []ACLRule, allObjects map[string]*Node) 
 			if !strings.Contains(serv.Type, "icmp") {
 				service += ":" + serv.Port
 			}
+
+			if serv.Type == "CpmiAnyObject" {
+				service = "Any"
+			}
+
 			service += "\n"
 
 		}
 
-		err := table.AddValues(fmt.Sprintf("%d", aclr.Number), src, dst, service)
+		err := table.AddValues(fmt.Sprintf("%d", aclr.Number), src, dst, service, allObjects[aclr.Action].Name)
 		check(err)
 
 	}
 
+}
+
+func recurseServiceGroup(service *Node, groupName string, allObjects map[string]*Node) string {
+	services := ""
+	for _, member := range service.Members {
+		subservice := allObjects[member]
+		if subservice.Type == "service-group" {
+
+			services += recurseServiceGroup(subservice, subservice.Name, allObjects)
+
+			continue
+		}
+
+		services += groupName + ":" + subservice.Name + ":" + subservice.Type
+		if !strings.Contains(subservice.Type, "icmp") {
+			services += ":" + subservice.Port
+		}
+		services += "\n"
+	}
+
+	return services
 }
