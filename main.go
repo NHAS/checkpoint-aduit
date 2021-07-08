@@ -43,6 +43,7 @@ type Edge struct {
 }
 
 type ACLRule struct {
+	Firewall    string `json:"-"`
 	Action      string
 	Name        string
 	SrcNegate   bool `json:"source-negate"`
@@ -54,6 +55,36 @@ type ACLRule struct {
 	Enabled     bool
 	Number      int `json:"rule-number"`
 	Service     []string
+}
+
+type Interface struct {
+	Address    string `json:"ipv4-address"`
+	MaskLength int    `json:"ipv4-mask-length"`
+	Name       string `json:"interface-name"`
+	Dynamic    bool   `json:"dynamic-ip"`
+}
+
+type Gateway struct {
+	Address    string `json:"ipv4-address"`
+	Name       string
+	Uid        string
+	Interfaces []Interface
+}
+
+func (g *Gateway) Belongs(ip net.IP) string {
+
+	for _, i := range g.Interfaces {
+		rangeString := fmt.Sprintf("%s/%d", i.Address, i.MaskLength)
+		_, network, err := net.ParseCIDR(rangeString)
+		check(err)
+
+		if network.Contains(ip) {
+			return rangeString
+		}
+
+	}
+
+	return ""
 }
 
 func Bidirectional(n1 *Node, n2 *Node) {
@@ -77,7 +108,7 @@ func check(err error) {
 	}
 }
 
-func loadObjects(paths []string) (names map[string]string, objects map[string]*Node) {
+func loadObjects(paths []string) (names map[string]string, objects map[string]*Node, gateways []Gateway) {
 
 	groups := []*Node{}
 	networks := []*Node{}
@@ -99,7 +130,7 @@ func loadObjects(paths []string) (names map[string]string, objects map[string]*N
 			var n Node
 			check(json.Unmarshal(v, &n))
 
-			if _, ok := objects[n.Uid]; ok {
+			if _, ok := objects[n.Uid]; ok && n.Type != "CpmiVsClusterNetobj" {
 				if n.Hash() != objects[n.Uid].Hash() {
 					log.Fatalf("Nodes not equal\n%v\n%v", n, objects[n.Uid])
 				}
@@ -116,6 +147,10 @@ func loadObjects(paths []string) (names map[string]string, objects map[string]*N
 				groups = append(groups, &n)
 			case "network":
 				networks = append(networks, &n)
+			case "CpmiVsClusterNetobj":
+				var g Gateway
+				check(json.Unmarshal(v, &g))
+				gateways = append(gateways, g)
 			}
 
 			names[n.Name] = n.Uid
@@ -155,7 +190,7 @@ func main() {
 	matches, err := filepath.Glob(path.Join(*directory, "*_objects.json"))
 	check(err)
 
-	namesMap, allObjects := loadObjects(matches)
+	namesMap, allObjects, gateways := loadObjects(matches)
 
 	if *target == "" {
 		for n := range namesMap {
@@ -164,11 +199,40 @@ func main() {
 		return
 	}
 
+	targetObject, ok := allObjects[namesMap[*target]]
+	if !ok {
+		log.Fatalf("Target %s not found", *target)
+	}
+
 	var associatedNodes []*Node
 	if !*childrenOnly {
-		associatedNodes = getPermissionGroups(allObjects[namesMap[*target]])
+		associatedNodes = getPermissionGroups(targetObject)
 	} else {
-		associatedNodes = getAllChildren(allObjects[namesMap[*target]])
+		associatedNodes = getAllChildren(targetObject)
+	}
+
+	if targetObject.Type == "network" || targetObject.Type == "host" {
+
+		var ipaddress net.IP
+		switch targetObject.Type {
+		case "network":
+			ipaddress, _, err = net.ParseCIDR(fmt.Sprintf("%s/%d", targetObject.SubnetAddress))
+			check(err)
+		case "host":
+			ipaddress = net.ParseIP(targetObject.IPv4)
+		}
+
+		t, err := table.NewTable("Egress Gateways", "Name", "Matching Range", "UID")
+		check(err)
+
+		for _, g := range gateways {
+			rangeString := g.Belongs(ipaddress)
+			if rangeString != "" {
+				t.AddValues(g.Name, rangeString, g.Uid)
+			}
+		}
+
+		t.Print()
 	}
 
 	t, err := table.NewTable(*target+" Belongs To", "Name", "Type", "Extra", "Comment", "UID")
@@ -218,8 +282,10 @@ func main() {
 				check(json.Unmarshal(r, &acl))
 				if acl.Enabled {
 
+					acl.Firewall = strings.SplitN(path.Base(p), "_", 2)[0]
+
 					for _, uid := range acl.Source {
-						applies := doesRuleApply(checkMap, allObjects, acl, uid)
+						applies := doRuleApply(checkMap, allObjects, acl, uid)
 						//Xor If it applies and is not negated, and if it doesnt apply but is negated
 						if applies != acl.SrcNegate {
 							accessTo = append(accessTo, acl)
@@ -228,7 +294,7 @@ func main() {
 					}
 
 					for _, uid := range acl.Destination {
-						applies := doesRuleApply(checkMap, allObjects, acl, uid)
+						applies := doRuleApply(checkMap, allObjects, acl, uid)
 						if applies != acl.DstNegate {
 							accessFrom = append(accessFrom, acl)
 							continue OuterLoop
@@ -243,13 +309,13 @@ func main() {
 
 	fmt.Print("\n")
 
-	accessToTable, _ := table.NewTable(*target+"->Target", "No.", "Src", "Dst", "Service", "Action")
+	accessToTable, _ := table.NewTable(*target+"->Target", "Firewall", "No.", "Src", "Dst", "Service", "Action")
 	buildTable(&accessToTable, accessTo, allObjects)
 	accessToTable.Print()
 
 	fmt.Print("\n")
 
-	accessFromTable, _ := table.NewTable("Target->"+*target, "No.", "Src", "Dst", "Service", "Action")
+	accessFromTable, _ := table.NewTable("Target->"+*target, "Firewall", "No.", "Src", "Dst", "Service", "Action")
 	buildTable(&accessFromTable, accessFrom, allObjects)
 	accessFromTable.Print()
 
@@ -312,7 +378,7 @@ func getPermissionGroups(n *Node) (assoc []*Node) {
 	return
 }
 
-func doesRuleApply(associatedObjects map[string]bool, allObjects map[string]*Node, acl ACLRule, uid string) bool {
+func doRuleApply(associatedObjects map[string]bool, allObjects map[string]*Node, acl ACLRule, uid string) bool {
 	return (associatedObjects[uid] || allObjects[uid].Type == "CpmiAnyObject")
 }
 
@@ -363,7 +429,7 @@ func buildTable(table *table.Table, acl []ACLRule, allObjects map[string]*Node) 
 
 		}
 
-		err := table.AddValues(fmt.Sprintf("%d", aclr.Number), src, dst, service, allObjects[aclr.Action].Name)
+		err := table.AddValues(aclr.Firewall, fmt.Sprintf("%d", aclr.Number), src, dst, service, allObjects[aclr.Action].Name)
 		check(err)
 
 	}
