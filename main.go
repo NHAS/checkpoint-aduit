@@ -216,7 +216,7 @@ func main() {
 		var ipaddress net.IP
 		switch targetObject.Type {
 		case "network":
-			ipaddress, _, err = net.ParseCIDR(fmt.Sprintf("%s/%d", targetObject.SubnetAddress))
+			ipaddress, _, err = net.ParseCIDR(fmt.Sprintf("%s/%d", targetObject.SubnetAddress, targetObject.MaskLength))
 			check(err)
 		case "host":
 			ipaddress = net.ParseIP(targetObject.IPv4)
